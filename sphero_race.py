@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Sphero BOLT — Autorun (oneindig) met automatische kalibratie (best-effort), wijzerszin
-- Geen joystick nodig
-- Kalibratie gebruikt locator als beschikbaar; anders slaat die netjes over
-- Start automatisch na 3 s (countdown)
+Sphero BOLT — Autorun (oneindig) op afstand + draaien, met calibratie-offset
+- Geen joystick
+- Auto-calibratie (best-effort): heading-offset + snelheidsfactor (als locator beschikbaar)
+- Rijdt segmenten: (afstand_in_meter -> draai_in_graden), negatief = rechtsaf
 - Blijft rondjes rijden tot Ctrl+C
+
+Benodigd:
+  pip install spherov2 bleak dbus-next
+Gebruik:
+  python3 sphero_autorun_distance.py SB-27A5
 """
 
 import sys
@@ -16,7 +21,7 @@ from spherov2.types import Color
 from spherov2.sphero_edu import SpheroEduAPI
 from spherov2.commands.power import Power
 
-# ---------- Instellingen ----------
+# ------------------ Instellingen ------------------
 COUNTDOWN_S = 3
 PAUSE_SEG   = 0.07
 
@@ -25,56 +30,37 @@ M_PER_S_AT_170 = 0.60
 
 STRAIGHT_SPEED = 180       # rechte stukken
 TURN_SPEED     = 140       # bochten
-HEADING_OFFSET = 0.0       # vaste offset; wordt gezet als kalibratie lukt
+HEADING_OFFSET = 0.0       # wordt gezet bij auto-calibratie (graden)
 
-# Waypoints in meters (paneel = 0.50 m), (0,0) = midden start/finish, +x rechts, +y omlaag
-WAYPOINTS = [
-    (0.00, 0.00),  # start/finish
-    (2.20, 0.00),  # bovenlangs naar rechts
-    (2.35, 2.35),  # rechts naar beneden
-    (1.95, 2.00),  # boog naar links-in
-    (1.55, 1.65),
-    (1.20, 1.45),
-    (0.80, 1.30),  # door het midden linkswaarts
-    (0.60, 0.70),  # omhoog richting linksboven
-    (0.35, 0.25),  # vlak voor bovenrand
-    (0.00, 0.00),  # finish
-]
-
-
+# Segmenten volgens je foto: (afstand in m, draai NA het stuk in °)
+# 0° = naar rechts (eerste pijl). Negatief = rechtsaf, positief = linksaf.
 SEGMENTS_DISTANCE_TURNS = [
-    (2.20, -90),  # rij 2.20 m → rechtsaf
-    (2.35, -35),  # rij 2.35 m → lichte bocht rechts (voorbeeld)
-    (0.60, -25),
-    (0.55, -20),
-    (0.45, -15),
-    (0.45, -20),
-    (0.70, -60),
-    (0.50, -35),
-    (0.35,   0),  # laatste stuk → geen extra draai nodig
+    (2.30, -90),  # top van X naar rechts, dan omlaag
+    (2.40, -45),  # langs rechterzijde naar beneden -> begin lange bocht
+    (0.70, -35),
+    (0.90, -25),
+    (0.90, -15),
+    (0.80, +60),  # linksom omhoog draaien
+    (1.80, -90),  # omhoog, hoek rechtsaf
+    (2.30,   0),  # over de top terug naar de finish
 ]
 
-# ---------- Helpers ----------
-def heading_deg(p0, p1):
-    dx = p1[0] - p0[0]
-    dy = p1[1] - p0[1]
-    return math.degrees(math.atan2(-dy, dx)) % 360
-
-def dist_m(p0, p1):
-    return math.hypot(p1[0] - p0[0], p1[1] - p0[1])
+# ------------------ Helpers ------------------
+def norm_deg(a):
+    return (a + 360.0) % 360.0
 
 def apply_offset(hdg):
-    return (hdg + HEADING_OFFSET) % 360
+    """Logische heading -> fysiek commando, corrigeert met calibratie-offset."""
+    return norm_deg(hdg + HEADING_OFFSET)
 
 def safe_matrix_char(api, ch, color):
-    """Zet een ASCII-teken op de matrix; bij fout val terug op front-LED."""
+    """ASCII matrix; fallback naar front-LED als set_matrix faalt."""
     try:
         if not isinstance(ch, str) or len(ch) != 1 or ord(ch) > 127:
-            ch = "V"  # veilige fallback
+            ch = "V"
         api.set_matrix_character(ch, color)
     except Exception:
         try:
-            # korte “blink” met front-LED als fallback
             api.set_front_led(color)
         except Exception:
             pass
@@ -88,24 +74,26 @@ def show_countdown(api, seconds=3):
 def battery_led(api, toy):
     try:
         v = Power.get_battery_voltage(toy)
-        if v > 4.1:
-            api.set_front_led(Color(0, 255, 0))
-        elif v > 3.9:
-            api.set_front_led(Color(255, 255, 0))
-        elif v > 3.7:
-            api.set_front_led(Color(255, 128, 0))
-        else:
-            api.set_front_led(Color(255, 0, 0))
-        print(f"[INFO] Battery: {v:.2f} V")
     except Exception:
-        pass
+        return
+    if v > 4.1:
+        api.set_front_led(Color(0, 255, 0))
+    elif v > 3.9:
+        api.set_front_led(Color(255, 255, 0))
+    elif v > 3.7:
+        api.set_front_led(Color(255, 128, 0))
+    else:
+        api.set_front_led(Color(255, 0, 0))
+    print(f"[INFO] Battery: {v:.2f} V")
 
 def supports_locator(api):
     return hasattr(api, "get_location") and callable(getattr(api, "get_location"))
 
 def try_reset_locator(api):
+    """Reset de relatieve positie naar (0,0) als de API dat ondersteunt."""
     try:
-        api.reset_locator(); return True
+        api.reset_locator()
+        return True
     except AttributeError:
         pass
     for fname in ("set_location", "set_locator", "set_position"):
@@ -116,29 +104,35 @@ def try_reset_locator(api):
             continue
     return False
 
+# ------------------ Auto-calibratie ------------------
 def auto_calibrate(api, pulse_speed=120, pulse_time=0.70):
-    """Best-effort kalibratie via locator; overslaan als niet beschikbaar."""
+    """
+    Best-effort calibratie:
+      - Als locator beschikbaar: korte puls vooruit op logische 0°,
+        meet dx,dy -> bepaal HEADING_OFFSET en stel M_PER_S_AT_170 bij.
+      - Anders: sla over en gebruik default HEADING_OFFSET.
+    """
     global HEADING_OFFSET, M_PER_S_AT_170
 
     print("[CAL] Auto-calibratie...")
     api.set_speed(0)
-    safe_matrix_char(api, "C", Color(255, 255, 0))  # C = Calibrate
+    safe_matrix_char(api, "C", Color(255, 255, 0))
     time.sleep(0.2)
 
     if not supports_locator(api):
-        print("[CAL] Locator niet beschikbaar → kalibratie overgeslagen (vaste HEADING_OFFSET).")
+        print("[CAL] Locator niet beschikbaar -> overslaan (gebruik vaste offset).")
         safe_matrix_char(api, "V", Color(0, 200, 255))
-        time.sleep(0.3)
+        time.sleep(0.2)
         return
 
     if not try_reset_locator(api):
-        print("[CAL] Locator kon niet gereset worden → kalibratie overgeslagen (vaste HEADING_OFFSET).")
+        print("[CAL] Locator kon niet gereset worden -> overslaan (vaste offset).")
         safe_matrix_char(api, "V", Color(0, 200, 255))
-        time.sleep(0.3)
+        time.sleep(0.2)
         return
 
-    # Puls vooruit op heading 0°
-    api.set_heading(0)
+    # Puls vooruit op 'logische' 0° (naar rechts)
+    api.set_heading(int(apply_offset(0)))
     api.set_speed(pulse_speed)
     time.sleep(pulse_time)
     api.set_speed(0)
@@ -149,65 +143,106 @@ def auto_calibrate(api, pulse_speed=120, pulse_time=0.70):
         dx = (loc.get('x', 0.0)) / 1000.0
         dy = (loc.get('y', 0.0)) / 1000.0
     except Exception:
-        print("[CAL] get_location() mislukt → kalibratie overgeslagen (vaste HEADING_OFFSET).")
+        print("[CAL] get_location() faalde -> overslaan (vaste offset).")
         safe_matrix_char(api, "V", Color(0, 200, 255))
-        time.sleep(0.3)
+        time.sleep(0.2)
         return
 
     dist = math.hypot(dx, dy)
     if dist < 0.02:
-        print("[CAL] Te weinig verplaatsing gemeten → kalibratie overgeslagen (vaste HEADING_OFFSET).")
+        print("[CAL] Te weinig verplaatsing -> overslaan (vaste offset).")
         safe_matrix_char(api, "V", Color(0, 200, 255))
-        time.sleep(0.3)
+        time.sleep(0.2)
         return
 
-    angle_moved = (math.degrees(math.atan2(-dy, dx)) % 360)
-    HEADING_OFFSET = (-angle_moved) % 360
+    # Werkelijke bewegingshoek bij commando 0°
+    angle_moved = norm_deg(math.degrees(math.atan2(-dy, dx)))
+    # Corrigeer zodat 'logische 0°' fysiek ook naar rechts wordt
+    HEADING_OFFSET = norm_deg(-angle_moved)
 
+    # Snelheidsmodel bijstellen (m/s bij 170)
     v_meas = dist / pulse_time
     M_PER_S_AT_170 = max(0.45, min(0.85, v_meas * 170.0 / pulse_speed))
 
     print(f"[CAL] dx={dx:.3f} m, dy={dy:.3f} m, angle={angle_moved:.1f}°, "
           f"OFFSET={HEADING_OFFSET:.1f}°, M170≈{M_PER_S_AT_170:.2f} m/s")
-
-    safe_matrix_char(api, "V", Color(0, 200, 255))  # V = “ok”/check
-
-def run_lap(api):
-    """Rijdt één volledige ronde volgens WAYPOINTS (met offset-correctie)."""
-    safe_matrix_char(api, "A", Color(0, 255, 0))  # A = Auto
-    t0 = time.time()
-    prev_hdg = None
-
-    for i in range(1, len(WAYPOINTS)):
-        p0, p1 = WAYPOINTS[i-1], WAYPOINTS[i]
-        hdg = heading_deg(p0, p1)
-        d   = dist_m(p0, p1)
-
-        if prev_hdg is None:
-            spd = STRAIGHT_SPEED
-        else:
-            turn = abs((hdg - prev_hdg + 540) % 360 - 180)
-            spd = TURN_SPEED if turn > 20 else STRAIGHT_SPEED
-
-        v_ms = M_PER_S_AT_170 * (spd / 170.0)
-        dur  = d / max(v_ms, 1e-6)
-
-        cmd_hdg = apply_offset(hdg)
-        api.set_heading(int(cmd_hdg))
-        api.set_speed(int(spd))
-        time.sleep(dur)
-        api.set_speed(0)
-        time.sleep(PAUSE_SEG)
-
-        prev_hdg = hdg
-        print(f"  segment {i}: req={int(hdg)}° cmd={int(cmd_hdg)}° d={d:.2f} m v={spd}")
-
-    lap_time = time.time() - t0
-    safe_matrix_char(api, "V", Color(0, 255, 0))  # V ≈ “ok”
-    print(f"[FINISH] Rondetijd: {lap_time:.2f} s")
+    safe_matrix_char(api, "V", Color(0, 200, 255))
     time.sleep(0.2)
 
-# ---------- Hoofdprogramma ----------
+# ------------------ Afstand + draaien ------------------
+def drive_forward_distance(api, heading_deg, distance_m, speed, timeout_factor=2.0):
+    """
+    Rijd rechtdoor tot 'distance_m' bereikt is.
+    - Met locator: meet d = hypot(x-x0, y-y0)
+    - Zonder locator: fallback op tijd (m/s-model)
+    Heading-commando wordt gecorrigeerd met HEADING_OFFSET.
+    """
+    use_locator = supports_locator(api) and try_reset_locator(api)
+
+    api.set_heading(int(apply_offset(heading_deg)))
+    api.set_speed(int(speed))
+
+    if use_locator:
+        try:
+            loc0 = api.get_location()
+            x0 = loc0.get('x', 0.0) / 1000.0
+            y0 = loc0.get('y', 0.0) / 1000.0
+        except Exception:
+            use_locator = False
+
+    if use_locator:
+        t0 = time.time()
+        v_ms = M_PER_S_AT_170 * (speed / 170.0)
+        est = max(0.1, distance_m / max(v_ms, 1e-6))
+        while True:
+            try:
+                loc = api.get_location()
+                x = loc.get('x', 0.0) / 1000.0
+                y = loc.get('y', 0.0) / 1000.0
+                d = math.hypot(x - x0, y - y0)
+                if d >= distance_m:
+                    break
+            except Exception:
+                break
+            if time.time() - t0 > est * timeout_factor:
+                break
+            time.sleep(0.02)
+    else:
+        v_ms = M_PER_S_AT_170 * (speed / 170.0)
+        dur = distance_m / max(v_ms, 1e-6)
+        time.sleep(dur)
+
+    api.set_speed(0)
+    time.sleep(PAUSE_SEG)
+
+def turn_by(api, current_heading_deg, delta_deg):
+    """
+    Pas de LOGISCHE heading aan met delta_deg; stuur met offset.
+    (Sphero draait niet in place – we wijzigen de aanstuur-heading.)
+    """
+    new_hdg = norm_deg(current_heading_deg + delta_deg)
+    api.set_heading(int(apply_offset(new_hdg)))
+    time.sleep(0.05)
+    return new_hdg
+
+def run_lap_by_distance(api, start_heading_deg=0):
+    """Rijdt één ronde op basis van afstand->draai segmenten."""
+    safe_matrix_char(api, "D", Color(0, 255, 0))  # D = Distance mode
+    t0 = time.time()
+    current_hdg = norm_deg(start_heading_deg)  # 0° = naar rechts (eerste pijl)
+
+    for idx, (dist_m, turn_deg) in enumerate(SEGMENTS_DISTANCE_TURNS, start=1):
+        spd = TURN_SPEED if abs(turn_deg) > 20 else STRAIGHT_SPEED
+        print(f"  segment {idx}: {dist_m:.2f} m @ {spd}, daarna draai {turn_deg:+.0f}°")
+        drive_forward_distance(api, current_hdg, dist_m, spd)
+        current_hdg = turn_by(api, current_hdg, turn_deg)
+
+    lap_time = time.time() - t0
+    safe_matrix_char(api, "V", Color(0, 255, 0))
+    print(f"[FINISH] Rondetijd (distance-mode): {lap_time:.2f} s")
+    time.sleep(0.2)
+
+# ------------------ Verbinden + main ------------------
 def pick_toy_by_name_or_scan(target_name: str):
     toy = scanner.find_toy(toy_name=target_name)
     if toy:
@@ -219,17 +254,14 @@ def pick_toy_by_name_or_scan(target_name: str):
         print("[ERR] Geen Sphero's gevonden bij scan.")
         return None
     for t in toys:
-        try:
-            if (t.name or "").strip() == target_name:
-                print(f"[INFO] Exacte match in scan: {t.name}")
-                return t
-        except Exception:
-            pass
+        if (t.name or "").strip() == target_name:
+            print(f"[INFO] Exacte match in scan: {t.name}")
+            return t
     for t in toys:
         if (t.name or "").startswith("SB-"):
             print(f"[INFO] Neem dichtstbijzijnde: {t.name}")
             return t
-    print("[ERR] Geen SB- devices gevonden in scan.")
+    print("[ERR] Geen SB- devices met SB- gevonden.")
     return None
 
 def main(toy_name):
@@ -245,10 +277,10 @@ def main(toy_name):
             with SpheroEduAPI(toy) as api:
                 battery_led(api, toy)
 
-                # 1) Kalibratie (best-effort)
+                # 1) Auto-calibratie (heading-offset + m/s, indien mogelijk)
                 auto_calibrate(api)
 
-                # 2) Countdown en oneindig rondjes
+                # 2) Countdown en oneindig rondjes op distance-mode
                 print(f"[INFO] Start over {COUNTDOWN_S} s.")
                 show_countdown(api, COUNTDOWN_S)
 
@@ -256,8 +288,7 @@ def main(toy_name):
                 while True:
                     lap += 1
                     print(f"\n=== LAP {lap} ===")
-                    run_lap(api)
-
+                    run_lap_by_distance(api, start_heading_deg=0)  # 0° = naar rechts
                     api.set_led(Color(0, 0, 0))
                     api.set_front_led(Color(0, 255, 0))
                     if lap % 5 == 0:
@@ -274,8 +305,8 @@ def main(toy_name):
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Gebruik: python3 sphero_autorun.py <SB-naam>")
-        print("Voorbeeld: python3 sphero_autorun.py SB-27A5")
+        print("Gebruik: python3 sphero_autorun_distance.py <SB-naam>")
+        print("Voorbeeld: python3 sphero_autorun_distance.py SB-27A5")
         sys.exit(1)
 
     toy_name = sys.argv[1]
