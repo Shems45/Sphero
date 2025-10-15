@@ -6,11 +6,6 @@ Sphero BOLT — Autorun (oneindig) met automatische kalibratie (best-effort), wi
 - Kalibratie gebruikt locator als beschikbaar; anders slaat die netjes over
 - Start automatisch na 3 s (countdown)
 - Blijft rondjes rijden tot Ctrl+C
-
-Benodigd:
-  pip install spherov2 bleak dbus-next
-Gebruik:
-  python3 sphero_autorun.py SB-27A5
 """
 
 import sys
@@ -44,6 +39,19 @@ WAYPOINTS = [
     (0.60, 0.70),  # omhoog richting linksboven
     (0.35, 0.25),  # vlak voor bovenrand
     (0.00, 0.00),  # finish
+]
+
+
+SEGMENTS_DISTANCE_TURNS = [
+    (2.20, -90),  # rij 2.20 m → rechtsaf
+    (2.35, -35),  # rij 2.35 m → lichte bocht rechts (voorbeeld)
+    (0.60, -25),
+    (0.55, -20),
+    (0.45, -15),
+    (0.45, -20),
+    (0.70, -60),
+    (0.50, -35),
+    (0.35,   0),  # laatste stuk → geen extra draai nodig
 ]
 
 # ---------- Helpers ----------
